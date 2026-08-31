@@ -1,0 +1,364 @@
+#!/usr/bin/env bash
+# byakugan — content-inspection companion to sharingan-go, not a rerun of it.
+#
+# Division of labor: sharingan-go owns subdomain enum, probing, port
+# scanning, JS crawl/intel, WAF fingerprinting, origin-IP discovery, and
+# block isolation — all gated behind its stealth engine. byakugan picks up
+# exactly where it stops. Check `internal/output/layout.go` in
+# tooling/sharingan-go and you'll find fields it already reserves a
+# filename for but never writes (raw_responses/, screenshots/, paths.txt,
+# params.txt, auth_urls, sqli_candidates, xss_candidates — the "screenshots
+# / wordlist / sqli / xss" phases are literal TODO stubs there). byakugan
+# fills exactly those, using the proven tomnomnom-toolchain commands this
+# workspace used before sharingan-go existed (meg, aquatone, tok, unfurl,
+# dsss, kxss, dalfox), plus one thing sharingan-go never reserved space for
+# at all: cariddi-style secrets/juicy-endpoint crawling.
+#
+# It reads the SAME target directory sharingan-go writes to (hosts, urls,
+# inscope.txt) and writes into the SAME filenames sharingan-go's layout
+# already promises — so the two tools share one coherent per-target output
+# without ever duplicating each other's work. Run `sharingan psv`/`act`
+# FIRST; byakugan has nothing to do until hosts/urls exist.
+#
+# Named for the Byakugan — the "all-seeing" dojutsu, as the thematic
+# complement to Sharingan: sharingan-go copies/automates the mechanical
+# recon; byakugan is the deep-look pass — raw page bodies, screenshots,
+# secrets sitting in page source, marker-based SQLi/XSS leads — the stuff
+# you'd otherwise have to eyeball by hand.
+#
+# Usage:
+#   byakugan <target-dir> [flags]
+#
+# Flags:
+#   --only <phases>       comma list: rawfetch,screenshots,wordlist,authgrep,secrets,sqli,xss
+#   --skip <phases>       comma list, same vocabulary
+#   --resume              skip a phase whose output file/dir already has content
+#   --dry-run             print what would run, send/execute nothing
+#   --profile <name>      ninja|normal|loud — conservative | default | unthrottled (default: normal)
+#   --blind-xss <url>     your blind-XSS collector — required for the xss phase, no hardcoded default
+#   --no-scope-check      proceed even without an inscope.txt (loud warning) — off by default
+#   -v                     verbose
+#   -h, --help             this text
+#
+# Phase vocabulary (in run order):
+#   rawfetch    meg root-fetch of every in-scope host          -> raw_responses/
+#   screenshots aquatone visual recon of every in-scope host    -> screenshots/
+#   wordlist    tok/unfurl path+param extraction from domains/urls -> paths.txt, params.txt
+#   authgrep    zero-network grep of urls for auth/reset/token paths -> auth_urls
+#   secrets     cariddi secrets + juicy-extension crawl          -> secrets_juicy/{secrets,juicy}
+#   sqli        marker-based SQLi scan via dsss                  -> sqli_candidates
+#   xss         marker-based XSS scan via kxss+dalfox            -> xss_candidates
+#
+# Every artifact is written with `anew` where the tool supports piping
+# through it — append-only, deduped, same convention as sharingan-go and
+# the retired recon.sh/scanners.sh. A missing tool skips its phase with a
+# clear message; nothing here hard-crashes the run.
+set -uo pipefail
+
+# ---------------------------------------------------------------- helpers --
+
+SCRIPT_NAME="byakugan"
+VERBOSE=0
+DRY_RUN=0
+RESUME=0
+NO_SCOPE_CHECK=0
+PROFILE="normal"
+BLIND_XSS=""
+ONLY=""
+SKIP=""
+
+log()  { echo "[$SCRIPT_NAME] $*" >&2; }
+vlog() { [[ "$VERBOSE" -eq 1 ]] && echo "[$SCRIPT_NAME:v] $*" >&2; return 0; }
+die()  { echo "[$SCRIPT_NAME] ERROR: $*" >&2; exit 1; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+  sed -n '2,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+# phase selection: true if $1 should run given --only/--skip
+wants_phase() {
+  local phase="$1"
+  if [[ -n "$ONLY" ]]; then
+    [[ ",$ONLY," == *",$phase,"* ]] && return 0 || return 1
+  fi
+  if [[ -n "$SKIP" ]]; then
+    [[ ",$SKIP," == *",$phase,"* ]] && return 1
+  fi
+  return 0
+}
+
+# resume check: given a file or dir, true if it already has content
+already_has_output() {
+  local path="$1"
+  if [[ -d "$path" ]]; then
+    [[ -n "$(ls -A "$path" 2>/dev/null)" ]]
+  elif [[ -f "$path" ]]; then
+    [[ -s "$path" ]]
+  else
+    return 1
+  fi
+}
+
+maybe_skip_resume() {
+  local phase="$1" out="$2"
+  if [[ "$RESUME" -eq 1 ]] && already_has_output "$out"; then
+    log "$phase: --resume set and $out already has content, skipping"
+    return 0
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------- scope filter --
+# Same allow-list semantics as tooling/sharingan-go/internal/scope/scope.go:
+# a bare root or "*.root" line covers the root and every subdomain. This is
+# defense-in-depth, not the primary guarantee — hosts/urls/domains written
+# by sharingan-go are already scope-safe by construction (it enforces
+# --scope on every request it sends), this just protects against a
+# hand-edited or stale artifact file being fed in directly.
+SCOPE_ROOTS=()
+
+load_scope() {
+  local scope_file="$1"
+  if [[ ! -f "$scope_file" ]]; then
+    if [[ "$NO_SCOPE_CHECK" -eq 1 ]]; then
+      log "WARNING: no inscope.txt at $scope_file — proceeding WITHOUT scope filtering (--no-scope-check set)"
+      return 0
+    fi
+    die "no inscope.txt at $scope_file — refusing to run network-touching phases without it. Pass --no-scope-check to override (not recommended)."
+  fi
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    line="$(echo -n "$line" | xargs)"
+    [[ -z "$line" ]] && continue
+    line="${line#\*.}"
+    SCOPE_ROOTS+=("${line,,}")
+  done < "$scope_file"
+  if [[ "${#SCOPE_ROOTS[@]}" -eq 0 && "$NO_SCOPE_CHECK" -ne 1 ]]; then
+    die "$scope_file has no usable entries"
+  fi
+}
+
+host_in_scope() {
+  local host="${1,,}"
+  host="${host%.}"
+  [[ "$NO_SCOPE_CHECK" -eq 1 && "${#SCOPE_ROOTS[@]}" -eq 0 ]] && return 0
+  local root
+  for root in "${SCOPE_ROOTS[@]}"; do
+    if [[ "$host" == "$root" || "$host" == *".$root" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Filters a file of bare hosts (one per line) to in-scope only.
+filter_hosts_file() {
+  local in="$1"
+  [[ -f "$in" ]] || return 0
+  while IFS= read -r h; do
+    h="$(echo -n "$h" | sed -E 's#^https?://##; s#[:/].*$##')"
+    [[ -z "$h" ]] && continue
+    if host_in_scope "$h"; then
+      echo "$h"
+    else
+      vlog "dropping out-of-scope host: $h"
+    fi
+  done < "$in"
+}
+
+# Filters a file of URLs to those whose host is in-scope.
+filter_urls_file() {
+  local in="$1"
+  [[ -f "$in" ]] || return 0
+  while IFS= read -r u; do
+    local h
+    h="$(echo -n "$u" | sed -E 's#^[a-zA-Z]+://##; s#[:/].*$##')"
+    [[ -z "$h" ]] && continue
+    if host_in_scope "$h"; then
+      echo "$u"
+    else
+      vlog "dropping out-of-scope url: $u"
+    fi
+  done < "$in"
+}
+
+# ------------------------------------------------------------- arg parse --
+
+TARGET_DIR=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --only) ONLY="$2"; shift 2 ;;
+    --skip) SKIP="$2"; shift 2 ;;
+    --resume) RESUME=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --profile) PROFILE="$2"; shift 2 ;;
+    --blind-xss) BLIND_XSS="$2"; shift 2 ;;
+    --no-scope-check) NO_SCOPE_CHECK=1; shift ;;
+    -v) VERBOSE=1; shift ;;
+    -h|--help) usage 0 ;;
+    -*) die "unknown flag: $1 (see --help)" ;;
+    *)
+      if [[ -z "$TARGET_DIR" ]]; then TARGET_DIR="$1"; shift
+      else die "unexpected extra argument: $1"; fi
+      ;;
+  esac
+done
+
+[[ -z "$TARGET_DIR" ]] && { echo "Usage: $SCRIPT_NAME <target-dir> [flags]  (see --help)" >&2; exit 1; }
+[[ -d "$TARGET_DIR" ]] || die "not a directory: $TARGET_DIR"
+TARGET_DIR="$(cd "$TARGET_DIR" && pwd)"   # resolve to absolute, so cwd never matters
+
+case "$PROFILE" in
+  ninja)  MEG_DELAY=1000; DALFOX_WORKERS=3;  CARIDDI_CONC=3  ;;
+  normal) MEG_DELAY=200;  DALFOX_WORKERS=10; CARIDDI_CONC=10 ;;
+  loud)   MEG_DELAY=10;   DALFOX_WORKERS=30; CARIDDI_CONC=30 ;;
+  *) die "unknown --profile: $PROFILE (ninja|normal|loud)" ;;
+esac
+vlog "profile=$PROFILE meg_delay=${MEG_DELAY}s dalfox_workers=$DALFOX_WORKERS cariddi_c=$CARIDDI_CONC"
+
+load_scope "$TARGET_DIR/inscope.txt"
+
+run() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "[dry-run] would run: $*"
+    return 0
+  fi
+  vlog "running: $*"
+  eval "$@"
+}
+
+# --------------------------------------------------------------- phases --
+
+phase_rawfetch() {
+  wants_phase rawfetch || return 0
+  local out="$TARGET_DIR/raw_responses"
+  maybe_skip_resume rawfetch "$out" && return 0
+  have meg || { log "rawfetch: meg not found, skipping"; return 0; }
+  [[ -f "$TARGET_DIR/hosts" ]] || { log "rawfetch: no hosts file yet — run sharingan act's probe phase first"; return 0; }
+  local scoped="$(mktemp)"
+  filter_hosts_file "$TARGET_DIR/hosts" > "$scoped"
+  if [[ ! -s "$scoped" ]]; then log "rawfetch: no in-scope hosts, skipping"; rm -f "$scoped"; return 0; fi
+  mkdir -p "$out"
+  # meg defaults to reading ./hosts and writing ./out/ — run it from a
+  # scratch dir with our filtered host list as "hosts", then fold its
+  # ./out/ into our raw_responses/ so the filename matches sharingan-go's
+  # reserved RawResponses field. Verify meg's exact flags against your
+  # installed version (`meg -h`) if this doesn't match — CLI details can
+  # drift between versions, same caveat sharingan-go's own README notes
+  # for katana.
+  local scratch="$(mktemp -d)"
+  cp "$scoped" "$scratch/hosts"
+  run "(cd \"$scratch\" && meg -d $MEG_DELAY -v /)"
+  if [[ -d "$scratch/out" ]]; then
+    run "cp -rn \"$scratch/out/.\" \"$out/\" 2>/dev/null || true"
+  fi
+  rm -rf "$scratch" "$scoped"
+  log "rawfetch: done -> $out/"
+}
+
+phase_screenshots() {
+  wants_phase screenshots || return 0
+  local out="$TARGET_DIR/screenshots"
+  maybe_skip_resume screenshots "$out" && return 0
+  have aquatone || { log "screenshots: aquatone not found, skipping"; return 0; }
+  [[ -f "$TARGET_DIR/hosts" ]] || { log "screenshots: no hosts file yet"; return 0; }
+  local scoped="$(mktemp)"
+  filter_hosts_file "$TARGET_DIR/hosts" > "$scoped"
+  if [[ ! -s "$scoped" ]]; then log "screenshots: no in-scope hosts, skipping"; rm -f "$scoped"; return 0; fi
+  mkdir -p "$out"
+  run "cat \"$scoped\" | aquatone -out \"$out\""
+  rm -f "$scoped"
+  log "screenshots: done -> $out/"
+}
+
+phase_wordlist() {
+  wants_phase wordlist || return 0
+  local pout="$TARGET_DIR/paths.txt" qout="$TARGET_DIR/params.txt"
+  if have tok && [[ -f "$TARGET_DIR/domains" ]]; then
+    run "cat \"$TARGET_DIR/domains\" | tok | sort -u | anew \"$pout\""
+  else
+    log "wordlist: tok not found or no domains file, skipping domain-derived paths"
+  fi
+  if have unfurl && [[ -f "$TARGET_DIR/urls" ]]; then
+    run "cat \"$TARGET_DIR/urls\" | unfurl -u paths | sed 's#/#\\n#g' | sort -u | anew \"$pout\""
+    if have uro; then
+      run "cat \"$TARGET_DIR/urls\" | uro | unfurl -u keys | sort -u | anew \"$qout\""
+    else
+      log "wordlist: uro not found, deriving params without it (fine, just less deduped)"
+      run "cat \"$TARGET_DIR/urls\" | unfurl -u keys | sort -u | anew \"$qout\""
+    fi
+  else
+    log "wordlist: unfurl not found or no urls file, skipping URL-derived wordlists"
+  fi
+  log "wordlist: done -> $pout, $qout"
+}
+
+phase_authgrep() {
+  wants_phase authgrep || return 0
+  [[ -f "$TARGET_DIR/urls" ]] || { log "authgrep: no urls file yet"; return 0; }
+  local out="$TARGET_DIR/auth_urls"
+  run "cat \"$TARGET_DIR/urls\" | grep -Ei 'pass|edit|token|key|username|forgot|reset' | anew \"$out\" 2>/dev/null || true"
+  log "authgrep: done -> $out (zero extra requests, pure local grep)"
+}
+
+phase_secrets() {
+  wants_phase secrets || return 0
+  local out="$TARGET_DIR/secrets_juicy"
+  maybe_skip_resume secrets "$out" && return 0
+  have cariddi || { log "secrets: cariddi not found, skipping"; return 0; }
+  [[ -f "$TARGET_DIR/hosts" ]] || { log "secrets: no hosts file yet"; return 0; }
+  local scoped="$(mktemp)"
+  filter_hosts_file "$TARGET_DIR/hosts" > "$scoped"
+  if [[ ! -s "$scoped" ]]; then log "secrets: no in-scope hosts, skipping"; rm -f "$scoped"; return 0; fi
+  mkdir -p "$out"
+  run "cat \"$scoped\" | cariddi -s -plain -c $CARIDDI_CONC -ot \"$out/secrets\""
+  run "cat \"$scoped\" | cariddi -e -plain -c $CARIDDI_CONC -ot \"$out/juicy\""
+  rm -f "$scoped"
+  log "secrets: done -> $out/{secrets,juicy}"
+}
+
+phase_sqli() {
+  wants_phase sqli || return 0
+  have dsss || { log "sqli: dsss not found, skipping"; return 0; }
+  [[ -f "$TARGET_DIR/urls" ]] || { log "sqli: no urls file yet"; return 0; }
+  local out="$TARGET_DIR/sqli_candidates"
+  local scoped="$(mktemp)"
+  filter_urls_file "$TARGET_DIR/urls" > "$scoped"
+  run "cat \"$scoped\" | grep '=' | egrep -iv '\\.(jpg|jpeg|gif|css|tif|tiff|png|ttf|woff|woff2|ico|pdf|svg|txt|js)' | qsreplace -a | dsss | anew \"$out\" 2>/dev/null || true"
+  rm -f "$scoped"
+  log "sqli: done -> $out (marker-based leads — verify by hand before calling anything a finding)"
+}
+
+phase_xss() {
+  wants_phase xss || return 0
+  have dalfox || { log "xss: dalfox not found, skipping"; return 0; }
+  [[ -z "$BLIND_XSS" ]] && { log "xss: skipped — no --blind-xss collector given (no hardcoded default, on purpose)"; return 0; }
+  [[ -f "$TARGET_DIR/urls" ]] || { log "xss: no urls file yet"; return 0; }
+  local out="$TARGET_DIR/xss_candidates"
+  local scoped="$(mktemp)"
+  filter_urls_file "$TARGET_DIR/urls" > "$scoped"
+  local base="cat \"$scoped\" | grep '=' | egrep -iv '\\.(jpg|jpeg|gif|css|tif|tiff|png|ttf|woff|woff2|ico|pdf|svg|txt|js)' | qsreplace -a"
+  if have kxss; then
+    run "$base | kxss | grep -Eo '(http|https)://[a-zA-Z0-9./?=_-]*' | dalfox pipe -b \"$BLIND_XSS\" -w $DALFOX_WORKERS | anew \"$out\" 2>/dev/null || true"
+  else
+    log "xss: kxss not found — piping straight to dalfox (works, just skips the pre-filter)"
+    run "$base | dalfox pipe -b \"$BLIND_XSS\" -w $DALFOX_WORKERS | anew \"$out\" 2>/dev/null || true"
+  fi
+  rm -f "$scoped"
+  log "xss: done -> $out (marker-based leads — verify by hand before calling anything a finding)"
+}
+
+# ---------------------------------------------------------------- main --
+
+log "target: $TARGET_DIR  profile: $PROFILE  dry-run: $DRY_RUN"
+phase_rawfetch
+phase_screenshots
+phase_wordlist
+phase_authgrep
+phase_secrets
+phase_sqli
+phase_xss
+log "done."
