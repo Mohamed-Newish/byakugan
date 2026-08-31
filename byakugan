@@ -321,9 +321,9 @@ phase_screenshots() {
   filter_hosts_file "$TARGET_DIR/hosts" > "$scoped"
   if [[ ! -s "$scoped" ]]; then log "screenshots: no in-scope hosts, skipping"; rm -f "$scoped"; return 0; fi
   mkdir -p "$out"
-  # -threads: aquatone's own concurrency flag. Not verified against a
-  # working local install at write time (see README) — double-check
-  # `aquatone -h` against your version if this errors.
+  # -threads: aquatone's own concurrency flag, verified against aquatone
+  # v1.7.0's real -h output. Needs Chrome/Chromium on PATH (or pass
+  # -chrome-path) to actually screenshot, not just probe.
   run "cat \"$scoped\" | aquatone -out \"$out\" -threads $AQUATONE_THREADS"
   rm -f "$scoped"
   log "screenshots: done -> $out/"
