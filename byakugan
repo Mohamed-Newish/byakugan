@@ -26,6 +26,14 @@
 # secrets sitting in page source, marker-based SQLi/XSS leads — the stuff
 # you'd otherwise have to eyeball by hand.
 #
+# Built for a hosts file with hundreds/thousands of entries: the 7 phases
+# below write to entirely separate output files, so — unlike sharingan-go's
+# --scope-gated single-stream stealth engine — they carry no shared state
+# and run CONCURRENTLY as background jobs by default (pass --sequential to
+# force one-at-a-time, e.g. while debugging one phase's output). Each
+# external tool gets its own concurrency flag wired through from
+# --profile, on top of that phase-level parallelism.
+#
 # Usage:
 #   byakugan <target-dir> [flags]
 #
@@ -33,14 +41,16 @@
 #   --only <phases>       comma list: rawfetch,screenshots,wordlist,authgrep,secrets,sqli,xss
 #   --skip <phases>       comma list, same vocabulary
 #   --resume              skip a phase whose output file/dir already has content
-#   --dry-run             print what would run, send/execute nothing
-#   --profile <name>      ninja|normal|loud — conservative | default | unthrottled (default: normal)
+#   --dry-run             print what would run, send/execute nothing (always sequential, for a readable preview)
+#   --sequential           run phases one at a time instead of concurrently (real runs are concurrent by default)
+#   --profile <name>      ninja|normal|loud — conservative | default | high-throughput (default: normal)
 #   --blind-xss <url>     your blind-XSS collector — required for the xss phase, no hardcoded default
 #   --no-scope-check      proceed even without an inscope.txt (loud warning) — off by default
 #   -v                     verbose
 #   -h, --help             this text
 #
-# Phase vocabulary (in run order):
+# Phase vocabulary (independent of each other — order shown is just the
+# --dry-run preview order, not a dependency chain):
 #   rawfetch    meg root-fetch of every in-scope host          -> raw_responses/
 #   screenshots aquatone visual recon of every in-scope host    -> screenshots/
 #   wordlist    tok/unfurl path+param extraction from domains/urls -> paths.txt, params.txt
@@ -51,8 +61,10 @@
 #
 # Every artifact is written with `anew` where the tool supports piping
 # through it — append-only, deduped, same convention as sharingan-go and
-# the retired recon.sh/scanners.sh. A missing tool skips its phase with a
-# clear message; nothing here hard-crashes the run.
+# the retired recon.sh/scanners.sh. A tool that's missing OR installed but
+# unable to actually run (e.g. a wrong-architecture binary — checked, not
+# assumed) skips its phase with a clear, specific message; nothing here
+# hard-crashes the run.
 set -uo pipefail
 
 # ---------------------------------------------------------------- helpers --
@@ -62,6 +74,7 @@ VERBOSE=0
 DRY_RUN=0
 RESUME=0
 NO_SCOPE_CHECK=0
+SEQUENTIAL=0
 PROFILE="normal"
 BLIND_XSS=""
 ONLY=""
@@ -71,10 +84,23 @@ log()  { echo "[$SCRIPT_NAME] $*" >&2; }
 vlog() { [[ "$VERBOSE" -eq 1 ]] && echo "[$SCRIPT_NAME:v] $*" >&2; return 0; }
 die()  { echo "[$SCRIPT_NAME] ERROR: $*" >&2; exit 1; }
 
-have() { command -v "$1" >/dev/null 2>&1; }
+# tool_ok: true only if $1 is both on PATH AND actually executes — catches
+# "installed but wrong architecture / corrupted binary" (exit 126 on exec
+# failure) as distinct from "not installed" (command -v already handles),
+# rather than assuming a PATH hit means the tool will actually run.
+tool_ok() {
+  command -v "$1" >/dev/null 2>&1 || return 1
+  "$1" -h >/dev/null 2>&1
+  local rc=$?
+  if [[ $rc -eq 126 ]]; then
+    log "WARNING: $1 is on PATH but would not execute (exit 126 — likely a wrong-architecture or corrupted binary). Skipping phases that need it."
+    return 1
+  fi
+  return 0
+}
 
 usage() {
-  sed -n '2,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,64p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -194,6 +220,7 @@ while [[ $# -gt 0 ]]; do
     --skip) SKIP="$2"; shift 2 ;;
     --resume) RESUME=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
+    --sequential) SEQUENTIAL=1; shift ;;
     --profile) PROFILE="$2"; shift 2 ;;
     --blind-xss) BLIND_XSS="$2"; shift 2 ;;
     --no-scope-check) NO_SCOPE_CHECK=1; shift ;;
@@ -211,13 +238,40 @@ done
 [[ -d "$TARGET_DIR" ]] || die "not a directory: $TARGET_DIR"
 TARGET_DIR="$(cd "$TARGET_DIR" && pwd)"   # resolve to absolute, so cwd never matters
 
+# Per-tool concurrency, wired from --profile. Each external tool has its
+# own internal concurrency flag except dsss (single -u per invocation, no
+# bulk/stdin mode despite its old recon.sh usage assuming one — see
+# phase_sqli), which is why that phase is parallelized with xargs -P
+# instead. meg's -d is milliseconds BETWEEN REPEATED REQUESTS TO THE SAME
+# HOST (not a global throttle) and rawfetch only ever requests one path
+# ("/") per host, so -d barely matters here — -c (concurrency) is what
+# actually controls rawfetch's speed against a big hosts file; kept for
+# correctness/future-proofing if more paths are ever added.
 case "$PROFILE" in
-  ninja)  MEG_DELAY=1000; DALFOX_WORKERS=3;  CARIDDI_CONC=3  ;;
-  normal) MEG_DELAY=200;  DALFOX_WORKERS=10; CARIDDI_CONC=10 ;;
-  loud)   MEG_DELAY=10;   DALFOX_WORKERS=30; CARIDDI_CONC=30 ;;
+  ninja)
+    MEG_DELAY=1000; MEG_CONC=10
+    AQUATONE_THREADS=10
+    CARIDDI_CONC=5
+    DALFOX_WORKERS=5
+    DSSS_PARALLEL=3
+    ;;
+  normal)
+    MEG_DELAY=200; MEG_CONC=50
+    AQUATONE_THREADS=30
+    CARIDDI_CONC=20
+    DALFOX_WORKERS=20
+    DSSS_PARALLEL=15
+    ;;
+  loud)
+    MEG_DELAY=0; MEG_CONC=150
+    AQUATONE_THREADS=100
+    CARIDDI_CONC=50
+    DALFOX_WORKERS=50
+    DSSS_PARALLEL=40
+    ;;
   *) die "unknown --profile: $PROFILE (ninja|normal|loud)" ;;
 esac
-vlog "profile=$PROFILE meg_delay=${MEG_DELAY}s dalfox_workers=$DALFOX_WORKERS cariddi_c=$CARIDDI_CONC"
+vlog "profile=$PROFILE meg_c=$MEG_CONC(delay ${MEG_DELAY}ms) aquatone_threads=$AQUATONE_THREADS cariddi_c=$CARIDDI_CONC dalfox_w=$DALFOX_WORKERS dsss_parallel=$DSSS_PARALLEL"
 
 load_scope "$TARGET_DIR/inscope.txt"
 
@@ -236,7 +290,7 @@ phase_rawfetch() {
   wants_phase rawfetch || return 0
   local out="$TARGET_DIR/raw_responses"
   maybe_skip_resume rawfetch "$out" && return 0
-  have meg || { log "rawfetch: meg not found, skipping"; return 0; }
+  tool_ok meg || { log "rawfetch: meg unavailable, skipping"; return 0; }
   [[ -f "$TARGET_DIR/hosts" ]] || { log "rawfetch: no hosts file yet — run sharingan act's probe phase first"; return 0; }
   local scoped="$(mktemp)"
   filter_hosts_file "$TARGET_DIR/hosts" > "$scoped"
@@ -245,13 +299,11 @@ phase_rawfetch() {
   # meg defaults to reading ./hosts and writing ./out/ — run it from a
   # scratch dir with our filtered host list as "hosts", then fold its
   # ./out/ into our raw_responses/ so the filename matches sharingan-go's
-  # reserved RawResponses field. Verify meg's exact flags against your
-  # installed version (`meg -h`) if this doesn't match — CLI details can
-  # drift between versions, same caveat sharingan-go's own README notes
-  # for katana.
+  # reserved RawResponses field. -c is concurrency (meg's own default: 20;
+  # we override per-profile above), -d is the same-host repeat delay in ms.
   local scratch="$(mktemp -d)"
   cp "$scoped" "$scratch/hosts"
-  run "(cd \"$scratch\" && meg -d $MEG_DELAY -v /)"
+  run "(cd \"$scratch\" && meg -c $MEG_CONC -d $MEG_DELAY -v /)"
   if [[ -d "$scratch/out" ]]; then
     run "cp -rn \"$scratch/out/.\" \"$out/\" 2>/dev/null || true"
   fi
@@ -263,13 +315,16 @@ phase_screenshots() {
   wants_phase screenshots || return 0
   local out="$TARGET_DIR/screenshots"
   maybe_skip_resume screenshots "$out" && return 0
-  have aquatone || { log "screenshots: aquatone not found, skipping"; return 0; }
+  tool_ok aquatone || { log "screenshots: aquatone unavailable, skipping (if this is a wrong-arch-binary warning above, reinstall the correct build for this machine — gowitness/eyewitness are drop-in alternatives if aquatone stays unfixable)"; return 0; }
   [[ -f "$TARGET_DIR/hosts" ]] || { log "screenshots: no hosts file yet"; return 0; }
   local scoped="$(mktemp)"
   filter_hosts_file "$TARGET_DIR/hosts" > "$scoped"
   if [[ ! -s "$scoped" ]]; then log "screenshots: no in-scope hosts, skipping"; rm -f "$scoped"; return 0; fi
   mkdir -p "$out"
-  run "cat \"$scoped\" | aquatone -out \"$out\""
+  # -threads: aquatone's own concurrency flag. Not verified against a
+  # working local install at write time (see README) — double-check
+  # `aquatone -h` against your version if this errors.
+  run "cat \"$scoped\" | aquatone -out \"$out\" -threads $AQUATONE_THREADS"
   rm -f "$scoped"
   log "screenshots: done -> $out/"
 }
@@ -277,21 +332,21 @@ phase_screenshots() {
 phase_wordlist() {
   wants_phase wordlist || return 0
   local pout="$TARGET_DIR/paths.txt" qout="$TARGET_DIR/params.txt"
-  if have tok && [[ -f "$TARGET_DIR/domains" ]]; then
+  if tool_ok tok && [[ -f "$TARGET_DIR/domains" ]]; then
     run "cat \"$TARGET_DIR/domains\" | tok | sort -u | anew \"$pout\""
   else
-    log "wordlist: tok not found or no domains file, skipping domain-derived paths"
+    log "wordlist: tok unavailable or no domains file, skipping domain-derived paths"
   fi
-  if have unfurl && [[ -f "$TARGET_DIR/urls" ]]; then
+  if tool_ok unfurl && [[ -f "$TARGET_DIR/urls" ]]; then
     run "cat \"$TARGET_DIR/urls\" | unfurl -u paths | sed 's#/#\\n#g' | sort -u | anew \"$pout\""
-    if have uro; then
+    if tool_ok uro; then
       run "cat \"$TARGET_DIR/urls\" | uro | unfurl -u keys | sort -u | anew \"$qout\""
     else
-      log "wordlist: uro not found, deriving params without it (fine, just less deduped)"
+      log "wordlist: uro unavailable, deriving params without it (fine, just less deduped)"
       run "cat \"$TARGET_DIR/urls\" | unfurl -u keys | sort -u | anew \"$qout\""
     fi
   else
-    log "wordlist: unfurl not found or no urls file, skipping URL-derived wordlists"
+    log "wordlist: unfurl unavailable or no urls file, skipping URL-derived wordlists"
   fi
   log "wordlist: done -> $pout, $qout"
 }
@@ -308,7 +363,7 @@ phase_secrets() {
   wants_phase secrets || return 0
   local out="$TARGET_DIR/secrets_juicy"
   maybe_skip_resume secrets "$out" && return 0
-  have cariddi || { log "secrets: cariddi not found, skipping"; return 0; }
+  tool_ok cariddi || { log "secrets: cariddi unavailable, skipping"; return 0; }
   [[ -f "$TARGET_DIR/hosts" ]] || { log "secrets: no hosts file yet"; return 0; }
   local scoped="$(mktemp)"
   filter_hosts_file "$TARGET_DIR/hosts" > "$scoped"
@@ -322,29 +377,34 @@ phase_secrets() {
 
 phase_sqli() {
   wants_phase sqli || return 0
-  have dsss || { log "sqli: dsss not found, skipping"; return 0; }
+  tool_ok dsss || { log "sqli: dsss unavailable, skipping"; return 0; }
   [[ -f "$TARGET_DIR/urls" ]] || { log "sqli: no urls file yet"; return 0; }
   local out="$TARGET_DIR/sqli_candidates"
   local scoped="$(mktemp)"
   filter_urls_file "$TARGET_DIR/urls" > "$scoped"
-  run "cat \"$scoped\" | grep '=' | egrep -iv '\\.(jpg|jpeg|gif|css|tif|tiff|png|ttf|woff|woff2|ico|pdf|svg|txt|js)' | qsreplace -a | dsss | anew \"$out\" 2>/dev/null || true"
+  # dsss has NO bulk/stdin mode — `-u <url>` is the only way in (confirmed:
+  # `dsss` with no -u just prints --help and exits 0, silently scanning
+  # nothing). A plain pipe into it, as the old recon.sh/scanners.sh did,
+  # never actually worked. Loop it explicitly instead, parallelized with
+  # xargs -P so a large URL list doesn't run one dsss process at a time.
+  run "cat \"$scoped\" | grep '=' | egrep -iv '\\.(jpg|jpeg|gif|css|tif|tiff|png|ttf|woff|woff2|ico|pdf|svg|txt|js)' | qsreplace -a | sort -u | xargs -P $DSSS_PARALLEL -I{} dsss -u {} 2>/dev/null | anew \"$out\" 2>/dev/null || true"
   rm -f "$scoped"
   log "sqli: done -> $out (marker-based leads — verify by hand before calling anything a finding)"
 }
 
 phase_xss() {
   wants_phase xss || return 0
-  have dalfox || { log "xss: dalfox not found, skipping"; return 0; }
+  tool_ok dalfox || { log "xss: dalfox unavailable, skipping"; return 0; }
   [[ -z "$BLIND_XSS" ]] && { log "xss: skipped — no --blind-xss collector given (no hardcoded default, on purpose)"; return 0; }
   [[ -f "$TARGET_DIR/urls" ]] || { log "xss: no urls file yet"; return 0; }
   local out="$TARGET_DIR/xss_candidates"
   local scoped="$(mktemp)"
   filter_urls_file "$TARGET_DIR/urls" > "$scoped"
   local base="cat \"$scoped\" | grep '=' | egrep -iv '\\.(jpg|jpeg|gif|css|tif|tiff|png|ttf|woff|woff2|ico|pdf|svg|txt|js)' | qsreplace -a"
-  if have kxss; then
+  if tool_ok kxss; then
     run "$base | kxss | grep -Eo '(http|https)://[a-zA-Z0-9./?=_-]*' | dalfox pipe -b \"$BLIND_XSS\" -w $DALFOX_WORKERS | anew \"$out\" 2>/dev/null || true"
   else
-    log "xss: kxss not found — piping straight to dalfox (works, just skips the pre-filter)"
+    log "xss: kxss unavailable — piping straight to dalfox (works, just skips the pre-filter)"
     run "$base | dalfox pipe -b \"$BLIND_XSS\" -w $DALFOX_WORKERS | anew \"$out\" 2>/dev/null || true"
   fi
   rm -f "$scoped"
@@ -352,13 +412,30 @@ phase_xss() {
 }
 
 # ---------------------------------------------------------------- main --
+# The 7 phases write to 7 disjoint output files/dirs (verified: no two
+# phases touch the same path), so there's no shared-state race running
+# them concurrently — the default for any real run. --dry-run always goes
+# sequential (nothing is actually slow to preview); --sequential forces it
+# on a real run too, e.g. to get clean, non-interleaved logs while
+# debugging one phase.
 
 log "target: $TARGET_DIR  profile: $PROFILE  dry-run: $DRY_RUN"
-phase_rawfetch
-phase_screenshots
-phase_wordlist
-phase_authgrep
-phase_secrets
-phase_sqli
-phase_xss
+
+PHASES=(rawfetch screenshots wordlist authgrep secrets sqli xss)
+
+if [[ "$DRY_RUN" -eq 1 || "$SEQUENTIAL" -eq 1 ]]; then
+  for p in "${PHASES[@]}"; do "phase_$p"; done
+else
+  pids=()
+  for p in "${PHASES[@]}"; do
+    "phase_$p" &
+    pids+=($!)
+  done
+  fail=0
+  for pid in "${pids[@]}"; do
+    wait "$pid" || fail=1
+  done
+  [[ $fail -eq 1 ]] && log "one or more phases exited non-zero — check the log lines above for which"
+fi
+
 log "done."

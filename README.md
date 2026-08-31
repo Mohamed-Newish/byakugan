@@ -47,6 +47,19 @@ SQLi/XSS leads.
 Always run sharingan-go first, byakugan second, against the same target
 directory. byakugan has nothing to do on an empty one.
 
+## Built for a hosts file with hundreds/thousands of entries
+
+The 7 phases below write to entirely disjoint output files — none of them
+read each other's output — so, unlike sharingan-go's single-stream stealth
+engine, they carry no shared state and **run concurrently as background
+jobs by default**. Pass `--sequential` to force one-at-a-time (useful
+while debugging one phase's output — concurrent logs interleave).
+`--dry-run` is always sequential regardless, since nothing is actually
+slow to preview.
+
+On top of that phase-level parallelism, every external tool gets its own
+concurrency knob wired through from `--profile` — see the table below.
+
 ## Usage
 
 ```bash
@@ -65,17 +78,18 @@ byakugan targets/example.com --blind-xss https://your-collector                #
 | `--only <phases>` | comma list — run just these phases |
 | `--skip <phases>` | comma list — skip these phases |
 | `--resume` | skip a phase whose output file/dir already has content |
-| `--dry-run` | print what would run, execute nothing |
+| `--dry-run` | print what would run, execute nothing (always sequential, for a readable preview) |
+| `--sequential` | run phases one at a time instead of concurrently (real runs are concurrent by default) |
 | `--profile <name>` | `ninja` \| `normal` (default) \| `loud` — see below |
 | `--blind-xss <url>` | your collector — required for the `xss` phase, no hardcoded default |
 | `--no-scope-check` | proceed even without an `inscope.txt` (loud warning) — off by default |
 | `-v` | verbose |
 | `-h`, `--help` | usage |
 
-### Phases (run order)
+### Phases (independent — no phase reads another's output)
 
 ```
-rawfetch → screenshots → wordlist → authgrep → secrets → sqli → xss
+rawfetch  screenshots  wordlist  authgrep  secrets  sqli  xss
 ```
 
 | Phase | Tool | Writes |
@@ -85,23 +99,37 @@ rawfetch → screenshots → wordlist → authgrep → secrets → sqli → xss
 | `wordlist` | `tok` + `unfurl` (+ `uro` if present) | `paths.txt`, `params.txt` |
 | `authgrep` | plain `grep` — zero extra requests | `auth_urls` |
 | `secrets` | `cariddi` | `secrets_juicy/{secrets,juicy}` |
-| `sqli` | `qsreplace` + `dsss` | `sqli_candidates` |
+| `sqli` | `qsreplace` + `dsss`, looped (see note) | `sqli_candidates` |
 | `xss` | `qsreplace` + `kxss` (optional) + `dalfox` | `xss_candidates` |
 
 Every artifact is appended with `anew` (dedupe, never overwrite) wherever
-the tool chain supports piping through it. A missing tool skips its own
-phase with a clear message — nothing here hard-crashes the run.
+the tool chain supports piping through it. A tool that's missing, **or
+installed but unable to actually execute** (checked by trying to run it,
+not assumed from a PATH hit — catches a wrong-architecture or corrupted
+binary), skips its own phase with a specific message — nothing here
+hard-crashes the run.
+
+**`dsss` has no bulk/stdin mode** — `dsss` with no `-u` just prints
+`--help` and exits `0`, scanning nothing. A plain `cat urls | dsss` pipe,
+the way the old `recon.sh`/`scanners.sh` ran it, never actually worked.
+`sqli` loops explicit `-u <url>` calls instead, parallelized with
+`xargs -P` (see the profile table) so a large URL list doesn't run one
+`dsss` process at a time.
 
 ### Stealth profiles
 
 Same three-tier vocabulary as sharingan-go, mapped onto the tools byakugan
-actually shells out to:
+actually shells out to. `meg -d` is **milliseconds between repeated
+requests to the *same* host** (not a global throttle) — `rawfetch` only
+ever requests one path (`/`) per host, so `-d` barely matters here; `-c`
+(concurrency) is what actually controls its speed against a large hosts
+file:
 
-| Profile | meg delay | dalfox workers | cariddi concurrency |
-|---|---|---|---|
-| `ninja` | 1000s | 3 | 3 |
-| `normal` (default) | 200s | 10 | 10 |
-| `loud` | 10s | 30 | 30 |
+| Profile | meg `-c`/`-d` | aquatone threads | cariddi `-c` | dalfox `-w` | dsss `xargs -P` |
+|---|---|---|---|---|---|
+| `ninja` | 10 / 1000ms | 10 | 5 | 5 | 3 |
+| `normal` (default) | 50 / 200ms | 30 | 20 | 20 | 15 |
+| `loud` | 150 / 0ms | 100 | 50 | 50 | 40 |
 
 Verify the exact flags against your installed tool versions (`meg -h`,
 `dalfox -h`, `cariddi -h`) if a version drift breaks a phase — CLI
@@ -135,11 +163,11 @@ ln -s "$(pwd)/byakugan/byakugan" ~/.local/bin/byakugan   # or copy it anywhere o
 | Tool | Used by | Notes |
 |---|---|---|
 | [meg](https://github.com/tomnomnom/meg) | `rawfetch` | |
-| [aquatone](https://github.com/michenriksen/aquatone) | `screenshots` | |
+| [aquatone](https://github.com/michenriksen/aquatone) | `screenshots` | if you grabbed a prebuilt binary, double-check it matches your machine's architecture (`file $(command -v aquatone)`) — byakugan detects a wrong-arch/corrupted binary at runtime and skips the phase with a specific warning rather than crashing, but it can't fix the binary for you |
 | [tok](https://github.com/tomnomnom/hacks/tree/master/tok), [unfurl](https://github.com/tomnomnom/unfurl) | `wordlist` | |
 | [uro](https://github.com/s0md3v/uro) | `wordlist` | optional — falls back to a less-deduped pass without it |
 | [qsreplace](https://github.com/tomnomnom/qsreplace), [anew](https://github.com/tomnomnom/anew) | `sqli`, `xss` (and everywhere else for deduping) | |
-| [dsss](https://github.com/stamparm/DSSS) | `sqli` | |
+| [dsss](https://github.com/stamparm/DSSS) | `sqli` | no bulk/stdin mode — byakugan loops `-u <url>` per candidate, parallelized with `xargs -P` |
 | [kxss](https://github.com/Emoe/kxss) | `xss` | optional — falls back to piping straight to `dalfox` without it |
 | [dalfox](https://github.com/hahwul/dalfox) | `xss` | |
 | [cariddi](https://github.com/edoardottt/cariddi) | `secrets` | |
